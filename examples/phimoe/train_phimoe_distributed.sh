@@ -17,6 +17,7 @@ MASTER_ADDR=${MASTER_ADDR:-"localhost"}
 MASTER_PORT=${MASTER_PORT:-"6000"}
 NNODES=${SLURM_NNODES:-"1"}
 NODE_RANK=${RANK:-"0"}
+ENABLE_NSYS_PROFILE=1
 
 CHECKPOINT_PATH=${SCRIPT_DIR}/checkpoints
 mkdir -p ${CHECKPOINT_PATH}
@@ -96,6 +97,24 @@ TRAINING_ARGS=(
     --bf16
 )
 
+PROFILE_CMD=()
+if [ "${ENABLE_NSYS_PROFILE}" = "1" ]; then
+    NSYS_OUTPUT_PREFIX=${SCRIPT_DIR}/train_phimoe_distributed_nsys
+    PROFILE_CMD=(
+        nsys profile
+        --force-overwrite true
+        --trace cuda,nvtx
+        -x true
+        -o "${NSYS_OUTPUT_PREFIX}"
+    )
+    TRAINING_ARGS+=(
+        --profile
+        --profile-step-start 5
+        --profile-step-end 20
+        --profile-ranks 0
+    )
+fi
+
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $GPUS_PER_NODE
     --pipeline-model-parallel-size 1
@@ -133,7 +152,10 @@ LOG_PATH=${SCRIPT_DIR}/train_phimoe_distributed.log
 /blob/utils/kill_nv.sh 1 true
 
 echo "Logging to ${LOG_PATH}"
-torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+if [ "${ENABLE_NSYS_PROFILE}" = "1" ]; then
+    echo "Nsight Systems enabled, writing traces to ${SCRIPT_DIR}"
+fi
+"${PROFILE_CMD[@]}" torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
     ${DATA_ARGS[@]} \

@@ -20,3 +20,11 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+
+
+*.log
+*.nsys-rep
+*.ipynb
+
+**/checkpoints/
+**/ckpt/

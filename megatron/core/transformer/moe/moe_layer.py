@@ -31,7 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -373,7 +373,11 @@ class MoELayer(BaseMoELayer):
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        nvtx_range_push(msg="moe_dispatch")
+        try:
+            return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        finally:
+            nvtx_range_pop(msg="moe_dispatch")
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
@@ -411,25 +415,29 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
-        dispatched_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
-        )
-        if (
-            hasattr(self, "_inference_token_dispatcher")
-            and self.is_inference_cuda_graphed_iteration
-        ):
-            routing_map = self.token_dispatcher.routing_map
-            expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+        nvtx_range_push(msg="moe_compute")
+        try:
+            dispatched_input, tokens_per_expert, permuted_probs = (
+                self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
             )
-        else:
-            expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, permuted_probs
-            )
-        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+            if (
+                hasattr(self, "_inference_token_dispatcher")
+                and self.is_inference_cuda_graphed_iteration
+            ):
+                routing_map = self.token_dispatcher.routing_map
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+                )
+            else:
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+            output = self.token_dispatcher.combine_preprocess(expert_output)
 
-        return output, mlp_bias
+            return output, mlp_bias
+        finally:
+            nvtx_range_pop(msg="moe_compute")
 
     def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
@@ -437,8 +445,12 @@ class MoELayer(BaseMoELayer):
         This method uses the token dispatcher to combine the outputs from different
         experts (e.g., via an All-to-All communication).
         """
-        output = self.token_dispatcher.token_combine(output)
-        return output
+        nvtx_range_push(msg="moe_combine")
+        try:
+            output = self.token_dispatcher.token_combine(output)
+            return output
+        finally:
+            nvtx_range_pop(msg="moe_combine")
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
