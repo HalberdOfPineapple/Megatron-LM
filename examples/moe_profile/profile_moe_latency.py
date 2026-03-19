@@ -140,11 +140,80 @@ def _build_balanced_routing(
 # Measurement
 # ---------------------------------------------------------------------------
 
+def _run_one_iter(layer, hidden, routing_map, probs, events, idx):
+    """Execute one MoE iteration, recording CUDA events at index *idx*."""
+    iter_starts, dispatch_starts, dispatch_ends = events[:3]
+    compute_starts, compute_ends, combine_starts, combine_ends, iter_ends = events[3:]
+
+    torch.cuda.synchronize()
+
+    h, p = layer.token_dispatcher.dispatch_preprocess(hidden, routing_map, probs)
+
+    iter_starts[idx].record()
+
+    dispatch_starts[idx].record()
+    h_disp, p_disp = layer.dispatch(h, p)
+    dispatch_ends[idx].record()
+
+    compute_starts[idx].record()
+    out, _ = layer.routed_experts_compute(h_disp, p_disp)
+    compute_ends[idx].record()
+
+    combine_starts[idx].record()
+    out = layer.combine(out)
+    combine_ends[idx].record()
+
+    layer.token_dispatcher.combine_postprocess(out)
+
+    iter_ends[idx].record()
+
+
+def _adaptive_warmup(layer, hidden, routing_map, probs, *, window: int = 40, cv_threshold: float = 0.05, min_iters: int = 50, max_iters: int = 1000):
+    """Run iterations until total-latency coefficient-of-variation (CV) over the
+    last *window* iterations drops below *cv_threshold*, or *max_iters* is reached.
+
+    Returns the number of warmup iterations actually executed.
+    """
+    import math
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    recent: list[float] = []
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+
+    for n in range(1, max_iters + 1):
+        torch.cuda.synchronize()
+        h, p = layer.token_dispatcher.dispatch_preprocess(hidden, routing_map, probs)
+        start_ev.record()
+        h_disp, p_disp = layer.dispatch(h, p)
+        out, _ = layer.routed_experts_compute(h_disp, p_disp)
+        out = layer.combine(out)
+        layer.token_dispatcher.combine_postprocess(out)
+        end_ev.record()
+        torch.cuda.synchronize()
+
+        recent.append(start_ev.elapsed_time(end_ev))
+        if len(recent) > window:
+            recent.pop(0)
+
+        if n >= min_iters and len(recent) == window:
+            mean = sum(recent) / window
+            std = math.sqrt(sum((x - mean) ** 2 for x in recent) / window)
+            cv = std / mean if mean > 0 else 0.0
+            if cv < cv_threshold:
+                if rank == 0:
+                    print(f"[adaptive warmup] converged after {n} iters "
+                          f"(CV={cv:.4f} < {cv_threshold})")
+                return n
+
+    if rank == 0:
+        print(f"[adaptive warmup] reached max {max_iters} iters without converging")
+    return max_iters
+
+
 def run_benchmark(layer: MoELayer, args: argparse.Namespace):
     device = torch.device("cuda")
     dtype = _resolve_dtype(args.dtype)
     num_tokens = args.num_tokens
-    total_iters = args.warmup_iters + args.measure_iters
 
     hidden = torch.randn(num_tokens, 1, args.hidden_size, device=device, dtype=dtype)
 
@@ -152,72 +221,47 @@ def run_benchmark(layer: MoELayer, args: argparse.Namespace):
     probs = torch.zeros(num_tokens, args.num_experts, device=device, dtype=torch.float32)
     probs[routing_map] = 1.0 / args.topk
 
-    # Pre-allocate all CUDA events.
-    # Per-phase events give a best-effort breakdown; the total event pair is the
-    # reliable metric because NCCL collectives and TE grouped-linear use internal
-    # async CUDA streams whose completion can shift between phase windows.
-    iter_starts      = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    dispatch_starts  = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    dispatch_ends    = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    compute_starts   = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    compute_ends     = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    combine_starts   = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    combine_ends     = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    iter_ends        = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-
-    # ---- Main loop ----
-    # A local torch.cuda.synchronize() at the top of each iteration prevents GPU
-    # work from the previous iteration leaking into the current measurement window
-    # and keeps all ranks entering NCCL collectives at roughly the same time.
-    # No dist.barrier() is used — the GPU sync is sufficient because the NCCL
-    # AlltoAll itself acts as an implicit cross-rank synchronisation point.
-    for i in range(total_iters):
+    # ---- Warmup phase ----
+    if args.adaptive_warmup:
+        warmup_done = _adaptive_warmup(layer, hidden, routing_map, probs)
+    else:
+        warmup_done = args.warmup_iters
+        for _ in range(warmup_done):
+            torch.cuda.synchronize()
+            h, p = layer.token_dispatcher.dispatch_preprocess(hidden, routing_map, probs)
+            h_disp, p_disp = layer.dispatch(h, p)
+            out, _ = layer.routed_experts_compute(h_disp, p_disp)
+            out = layer.combine(out)
+            layer.token_dispatcher.combine_postprocess(out)
         torch.cuda.synchronize()
 
-        h, p = layer.token_dispatcher.dispatch_preprocess(hidden, routing_map, probs)
+    # ---- Measurement phase ----
+    measure = args.measure_iters
+    iter_starts      = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    dispatch_starts  = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    dispatch_ends    = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    compute_starts   = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    compute_ends     = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    combine_starts   = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    combine_ends     = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
+    iter_ends        = [torch.cuda.Event(enable_timing=True) for _ in range(measure)]
 
-        iter_starts[i].record()
+    events = (iter_starts, dispatch_starts, dispatch_ends,
+              compute_starts, compute_ends, combine_starts, combine_ends, iter_ends)
 
-        dispatch_starts[i].record()
-        h_disp, p_disp = layer.dispatch(h, p)
-        dispatch_ends[i].record()
+    for i in range(measure):
+        _run_one_iter(layer, hidden, routing_map, probs, events, i)
 
-        compute_starts[i].record()
-        out, _ = layer.routed_experts_compute(h_disp, p_disp)
-        compute_ends[i].record()
-
-        combine_starts[i].record()
-        out = layer.combine(out)
-        combine_ends[i].record()
-
-        layer.token_dispatcher.combine_postprocess(out)
-
-        iter_ends[i].record()
-
-    # ---- Final sync after the loop ----
+    # ---- Final sync ----
     torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
 
-    # ---- Collect timings from event pairs ----
-    dispatch_ms = [
-        dispatch_starts[i].elapsed_time(dispatch_ends[i]) for i in range(total_iters)
-    ]
-    compute_ms = [
-        compute_starts[i].elapsed_time(compute_ends[i]) for i in range(total_iters)
-    ]
-    combine_ms = [
-        combine_starts[i].elapsed_time(combine_ends[i]) for i in range(total_iters)
-    ]
-    total_ms = [
-        iter_starts[i].elapsed_time(iter_ends[i]) for i in range(total_iters)
-    ]
-
-    # Strip warmup
-    dispatch_ms = dispatch_ms[args.warmup_iters:]
-    compute_ms  = compute_ms[args.warmup_iters:]
-    combine_ms  = combine_ms[args.warmup_iters:]
-    total_ms    = total_ms[args.warmup_iters:]
+    # ---- Collect timings ----
+    dispatch_ms = [dispatch_starts[i].elapsed_time(dispatch_ends[i]) for i in range(measure)]
+    compute_ms  = [compute_starts[i].elapsed_time(compute_ends[i])  for i in range(measure)]
+    combine_ms  = [combine_starts[i].elapsed_time(combine_ends[i])  for i in range(measure)]
+    total_ms    = [iter_starts[i].elapsed_time(iter_ends[i])        for i in range(measure)]
 
     return dispatch_ms, compute_ms, combine_ms, total_ms
 

@@ -35,8 +35,9 @@ DISPATCHER="alltoall"
 GROUPED_GEMM=1
 
 # ---------- Benchmark control ----------
-WARMUP_ITERS=50
-MEASURE_ITERS=300
+WARMUP_ITERS=${WARMUP_ITERS:-200}
+ADAPTIVE_WARMUP=${ADAPTIVE_WARMUP:-1}
+MEASURE_ITERS=${MEASURE_ITERS:-300}
 DTYPE=${DTYPE:-"bf16"}
 OUTPUT_DIR=${OUTPUT_DIR:-${SCRIPT_DIR}}
 
@@ -71,6 +72,10 @@ else
     PROFILE_ARGS+=(--no-grouped-gemm)
 fi
 
+if [ "${ADAPTIVE_WARMUP}" = "1" ]; then
+    PROFILE_ARGS+=(--adaptive-warmup)
+fi
+
 echo "=== MoE Layer Latency Profiler ==="
 echo "Tokens/rank : ${NUM_TOKENS}"
 echo "Hidden      : ${HIDDEN_SIZE}"
@@ -82,7 +87,7 @@ echo "TP size     : ${TP_SIZE}"
 echo "Dispatcher  : ${DISPATCHER}"
 echo "Grouped GEMM: ${GROUPED_GEMM}"
 echo "Dtype       : ${DTYPE}"
-echo "Warmup      : ${WARMUP_ITERS}"
+echo "Warmup      : ${WARMUP_ITERS} (adaptive=${ADAPTIVE_WARMUP})"
 echo "Measure     : ${MEASURE_ITERS}"
 echo "Output      : ${OUTPUT_DIR}"
 echo "=================================="
